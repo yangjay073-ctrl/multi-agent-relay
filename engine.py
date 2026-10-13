@@ -206,8 +206,9 @@ class Engine:
         return left
 
     def _get_json(self, build_prompt, validate, log, tag, timeout):
-        """调 A 并校验其 JSON 输出；缺字段打回补全，最多 PACK_RETRIES 次。"""
-        prompt = build_prompt()
+        """调 A 并校验其 JSON 输出；缺字段打回补全，最多 PACK_RETRIES 次。
+        打回时在原 prompt 后追加错误说明——无状态 API 的 A 只有拿到完整上下文才能补全（F4）。"""
+        original = prompt = build_prompt()
         last_err = None
         for _ in range(PACK_RETRIES):
             if self._stop.is_set():
@@ -222,7 +223,7 @@ class Engine:
                 return obj
             last_err = "；".join(errors)
             log(f"{tag}被打回：{last_err}")
-            prompt = f"你上次的输出不合法：{last_err}。请重新输出，只输出完整合法的 JSON。"
+            prompt = original + f"\n\n[校验失败] 你上次的输出不合法：{last_err}。请重新输出，只输出完整合法的 JSON。"
         raise PackInvalid(f"A 连续 {PACK_RETRIES} 次输出不合法（{tag}）：{last_err}")
 
     def run(self, directive: str, log=print) -> dict:

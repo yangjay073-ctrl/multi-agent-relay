@@ -244,4 +244,26 @@ r, logs, store = run_engine(HopelessA(), FakeB())
 no, st, ms, tpk, snt, bout, vdt, stage = store.rounds(r["session_id"])[0]
 assert st == "error" and stage == "plan" and tpk is None and snt is None
 
+# 18. F4 回归：打回重试的 prompt 保留原始上下文，一次格式失误不判死会话
+class BadReviewOnceA(FakeA):
+    def send(self, payload, timeout):
+        if payload.startswith("你是任务布置型 Agent A，现在验收"):
+            if "你上次的输出不合法" not in payload:
+                return "抱歉，这不是 JSON"  # 首次验收输出格式错误
+            assert "B 的产出" in payload, "验收打回后丢失 B 产出"
+            assert "修 bug" in payload, "验收打回后丢失任务包"
+            return '{"passed": true, "comments": "通过"}'
+        return super().send(payload, timeout)
+
+
+r, logs, _ = run_engine(BadReviewOnceA(bad_first=False), FakeB())
+assert r["status"] == "success" and r["rounds"] == 1, r
+
+a4 = FakeA(verdicts=[(True, "通过")])
+r, logs, _ = run_engine(a4, FakeB())
+retries = [p for p in a4.prompts if "你上次的输出不合法" in p]
+assert retries, "未发生打回"
+assert all(p.startswith("你是任务布置型 Agent A") for p in retries), "打回后丢失原上下文"
+assert any("用户指令" in p and "修复登录头像不刷新" in p for p in retries), "打回后丢失用户指令"
+
 print("OK — P0 全部自检通过")
