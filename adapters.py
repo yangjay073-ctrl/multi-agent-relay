@@ -61,36 +61,53 @@ class ClipboardAdapter(Adapter):
 
     def __init__(self, put_clipboard, notify_wait, launch_command: str = ""):
         """put_clipboard(text)：线程安全地把文本写入系统剪贴板（由 UI 注入）。
-        notify_wait(payload)：进入等待用户回传时通知 UI（由 UI 注入）。
+        notify_wait(adapter, payload, token)：进入等待时通知 UI，token 标识本次等待，
+        UI 回传时必须带回同一 token，防止上一轮的迟到回传串入下一轮（F6）。
         launch_command：可选，等待粘贴前尝试启动/聚焦的目标程序路径。"""
         self._put = put_clipboard
         self._notify = notify_wait
         self.launch_command = launch_command
         self._evt = threading.Event()
+        self._abort = threading.Event()
+        self._token = 0
+        self._active = False
         self._result = None
+
+    def is_waiting(self) -> bool:
+        """是否正处于一次未完成的 send 等待（UI 据此路由回传，F1）。"""
+        return self._active
 
     def send(self, payload: str, timeout: float) -> str:
+        if self._abort.is_set():  # 独立事件，不被下面的 clear() 吞掉（F8）
+            raise Aborted("剪贴板适配器已被终止")
+        self._token += 1
+        self._active = True
         self._evt.clear()
         self._result = None
-        self._put(payload)
-        if self.launch_command:
-            try:
-                os.startfile(self.launch_command)  # Windows：启动/聚焦目标程序
-            except OSError:
-                pass  # 聚焦失败不阻塞流程，剪贴板内容已就绪
-        self._notify(payload)
-        if not self._evt.wait(max(0.5, timeout)):
-            raise TimeoutError("等待剪贴板回传超时")
-        if self._result is None:
-            raise Aborted("用户终止")
-        return self._result
+        try:
+            self._put(payload)
+            if self.launch_command:
+                try:
+                    os.startfile(self.launch_command)  # Windows：启动/聚焦目标程序
+                except OSError:
+                    pass  # 聚焦失败不阻塞流程，剪贴板内容已就绪
+            self._notify(self, payload, self._token)
+            if not self._evt.wait(max(0.05, timeout)):
+                raise TimeoutError("等待剪贴板回传超时")
+            if self._result is None:
+                raise Aborted("用户终止")
+            return self._result
+        finally:
+            self._active = False
 
-    def deliver(self, text: str):
-        """UI 在用户粘贴回产出并点击回传时调用。"""
-        if text and text.strip():
-            self._result = text
-            self._evt.set()
+    def deliver(self, token: int, text: str) -> bool:
+        """UI 在用户粘贴回产出时调用。token 不匹配当前等待（迟到/失效）则丢弃。"""
+        if not self._active or token != self._token or not (text and text.strip()):
+            return False
+        self._result = text
+        self._evt.set()
+        return True
 
     def abort(self):
-        self._result = None
+        self._abort.set()
         self._evt.set()

@@ -49,7 +49,8 @@ class App:
         self.mock = None          # (a_url, b_url, stop)，惰性启动
         self.engine = None
         self.worker = None
-        self.clip_adapter = None
+        self.clip_adapters = []   # 所有剪贴板适配器实例，回传/终止都按等待状态路由（F1）
+        self._waiting = None      # (adapter, token)：当前正在等待回传的那一次 send
         self.logq = queue.Queue()
         self._build()
         root.after(100, self._poll)
@@ -139,13 +140,18 @@ class App:
         self.logq.put("已把内容写入系统剪贴板（等待人工粘贴 + 回传）")
         self.root.after(0, lambda: self.wait.pack(fill="x", pady=4))
 
-    def notify_wait(self, payload):
+    def notify_wait(self, adapter, payload, token):
+        """某个剪贴板适配器进入等待：记住 (adapter, token)，回传只投给正在等待的它（F1/F6）。"""
+        self._waiting = (adapter, token)
         self.logq.put(f"剪贴板模式：等待用户操作（本轮发出 {len(payload)} 字符）…")
 
     def deliver(self):
-        if self.clip_adapter:
-            self.clip_adapter.deliver(self.reply.get("1.0", "end").strip())
-            self.root.after(0, self.wait.pack_forget)
+        adapter, token = self._waiting or (None, -1)
+        text = self.reply.get("1.0", "end").strip()
+        if not adapter or not adapter.deliver(token, text):
+            self.log_line("回传已丢弃：该次等待已超时或已结束（须在下一轮等待期间重新回传）")
+            return
+        self.root.after(0, self.wait.pack_forget)
 
     # ---------- 会话 ----------
     def build_adapter(self, combo):
@@ -168,7 +174,7 @@ class App:
         except ValueError as e:
             self.log_line(f"配置错误：{e}")
             return
-        self.clip_adapter = next((x for x in (a, b) if isinstance(x, ClipboardAdapter)), None)
+        self.clip_adapters = [x for x in (a, b) if isinstance(x, ClipboardAdapter)]
         cfg = {"max_rounds": int(self.max_rounds.get()), "round_timeout": int(self.timeout.get())}
         self.engine = Engine(a, b, Store(), cfg)
 
@@ -189,8 +195,8 @@ class App:
     def stop(self):
         if self.engine:
             self.engine.stop()
-        if self.clip_adapter:
-            self.clip_adapter.abort()
+        for adapter in self.clip_adapters:   # 对所有剪贴板实例生效，不只第一个（F1）
+            adapter.abort()
         self.log_line("已请求终止（当前轮结束后生效；剪贴板等待立即解除）")
 
 

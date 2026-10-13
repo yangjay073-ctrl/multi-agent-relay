@@ -4,7 +4,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from engine import (Engine, Store, extract_json, validate_pack, validate_verdict,
                     sanitize, similarity)
-from adapters import Aborted
+from adapters import Aborted, ClipboardAdapter
 
 TMP_DB = "data/test_relay.db"
 
@@ -143,5 +143,63 @@ class HopelessA(FakeA):
         return "我拒绝输出 JSON"
 r, logs, _ = run_engine(HopelessA(), FakeB())
 assert r["status"] == "failed" and any("JSON 解析失败" in m for m in logs)
+
+# 11. F1 回归：A、B 同为剪贴板半自动也能完整跑通（回传路由到正在等待者）
+FULL_PACK = {"goal": "修 bug", "inputs": ["报告"], "steps": ["定位", "修复"],
+             "acceptance": ["测试过"], "forbidden": ["不改无关文件"]}
+
+
+def make_clip_pair():
+    import json as _json
+
+    def user_as_A(adapter, payload, token):
+        if payload.startswith("你是任务布置型 Agent A，现在验收"):
+            adapter.deliver(token, '{"passed": true, "comments": "全部标准已满足"}')
+        elif "你上次的输出不合法" in payload:
+            adapter.deliver(token, _json.dumps(FULL_PACK, ensure_ascii=False))
+        else:  # 首次出包故意缺 forbidden，顺带走一次打回
+            bad = {k: v for k, v in FULL_PACK.items() if k != "forbidden"}
+            adapter.deliver(token, _json.dumps(bad, ensure_ascii=False))
+
+    def user_as_B(adapter, payload, token):
+        adapter.deliver(token, "B 的产出：修复完成")
+
+    return (ClipboardAdapter(lambda t: None, user_as_A),
+            ClipboardAdapter(lambda t: None, user_as_B))
+
+
+r, logs, _ = run_engine(*make_clip_pair())
+assert r["status"] == "success" and r["rounds"] == 1, r
+assert r["final_output"] == "B 的产出：修复完成"
+
+# 12. F6 回归：超时后迟到的回传必须被丢弃，不得解除下一轮等待
+mode = {"round": 1}
+
+
+def late_notify(adapter, payload, token):
+    if mode["round"] == 2:
+        assert adapter.deliver(token - 1, "迟到的旧回复") is False, "旧 token 回传未被丢弃"
+        assert adapter.deliver(token, "新一轮的真实回复") is True
+
+
+late_ad = ClipboardAdapter(lambda t: None, late_notify)
+try:
+    late_ad.send("第一轮", 0.2)
+    assert False, "应超时"
+except TimeoutError:
+    pass
+assert late_ad.is_waiting() is False
+assert late_ad.deliver(1, "超时后的迟到回传") is False, "超时后的回传未被丢弃"
+mode["round"] = 2
+assert late_ad.send("第二轮", 2.0) == "新一轮的真实回复"
+
+# 13. F8 回归：等待前 abort 立即生效，不空等到 timeout
+dead = ClipboardAdapter(lambda t: None, lambda *a: None)
+dead.abort()
+try:
+    dead.send("x", 5.0)
+    assert False, "abort 后 send 应立即抛 Aborted"
+except Aborted:
+    pass
 
 print("OK — P0 全部自检通过")
