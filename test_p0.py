@@ -1,9 +1,10 @@
 """P0 自检：py test_p0.py，全绿输出 OK。覆盖校验打回/脱敏/相似度/引擎全流程/僵局/轮数/超时/留痕。"""
+import json
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
 from engine import (Engine, Store, extract_json, validate_pack, validate_verdict,
-                    sanitize, similarity)
+                    sanitize, sanitize_obj, similarity)
 from adapters import Aborted, ClipboardAdapter
 
 TMP_DB = "data/test_relay.db"
@@ -26,7 +27,8 @@ class FakeA:
             self.n_review += 1
             passed, c = self.verdicts[i]
             return f'{{"passed": {str(passed).lower()}, "comments": "{c}"}}'
-        pack = {"goal": "修 bug", "inputs": ["报告"], "steps": ["定位", "修复"],
+        pack = {"goal": "修 bug", "inputs": ["报告", "token: sk-fake1234567890abcd", {"手机": 13900001111}],
+                "steps": ["定位", "修复"],
                 "acceptance": ["测试过"], "forbidden": ["不改无关文件"]}
         if self.bad_first and "你上次的输出不合法" not in payload:
             pack.pop("forbidden")  # 首次缺 forbidden，等打回
@@ -44,7 +46,8 @@ class FakeB:
         if self.behavior == "error":
             from adapters import AdapterError
             raise AdapterError("模拟连接失败")
-        assert "[已脱敏:" in payload or "sk-" not in payload, "发给 B 的内容未脱敏"
+        json.loads(payload)  # F2: 发给 B 的内容必须恒为合法 JSON
+        assert "sk-fake1234567890abcd" not in payload and "13900001111" not in payload, "敏感值未脱敏"
         return "B 的产出：修复完成"
 
 
@@ -201,5 +204,16 @@ try:
     assert False, "abort 后 send 应立即抛 Aborted"
 except Aborted:
     pass
+
+# 14. F2 回归：脱敏在 JSON 结构上进行，数值型敏感值打码后 sent 仍是合法 JSON
+f2_pack = {"goal": "修 bug", "inputs": ["报告", "sk-testabcd5678efgh", {"user_id": 13812345678}],
+           "steps": ["s"], "acceptance": ["a"], "forbidden": ["f"], "meta": {"note": "手机 13912345678"}}
+clean_obj, hits = sanitize_obj(f2_pack)
+sent = json.dumps(clean_obj, ensure_ascii=False)
+reloaded = json.loads(sent)  # 数值被打成裸文本时这里必炸（F2 核心）
+assert hits >= 3, hits
+assert "sk-testabcd5678efgh" not in sent and "13812345678" not in sent and "13912345678" not in sent
+assert reloaded["goal"] == "修 bug" and reloaded["inputs"][2]["user_id"] == "[已脱敏:手机号]"
+assert f2_pack["inputs"][1] == "sk-testabcd5678efgh"  # 原对象不被原地修改
 
 print("OK — P0 全部自检通过")

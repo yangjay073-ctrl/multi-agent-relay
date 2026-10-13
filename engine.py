@@ -90,13 +90,45 @@ REDACTIONS = [
 ]
 
 
-def sanitize(text: str):
-    """正则打码，返回 (脱敏后文本, 命中数)。"""
+def _redact(text: str):
     hits = 0
     for pat, repl in REDACTIONS:
         text, n = pat.subn(repl, text)
         hits += n
     return text, hits
+
+
+def sanitize(text: str):
+    """整段文本脱敏，返回 (脱敏后文本, 命中数)。"""
+    return _redact(text)
+
+
+def sanitize_obj(obj):
+    """在 JSON 结构上脱敏（F2）：字符串/数值叶子过正则，数值命中转为带引号的
+    占位字符串，保证序列化后仍是合法 JSON。返回 (新结构, 命中数)，不改原对象。"""
+    hits = 0
+
+    def walk(v):
+        nonlocal hits
+        if isinstance(v, str):
+            new, n = _redact(v)
+            hits += n
+            return new
+        if isinstance(v, bool) or v is None:
+            return v
+        if isinstance(v, (int, float)):
+            new, n = _redact(str(v))
+            if n:
+                hits += n
+                return new  # 数值敏感值 -> "[已脱敏:xx]" 字符串，避免裸文本破坏 JSON
+            return v
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        return v
+
+    return walk(obj), hits
 
 
 def similarity(a: str, b: str) -> float:
@@ -199,9 +231,10 @@ class Engine:
                     lambda: PLAN_PROMPT.format(directive=directive, history=history),
                     validate_pack, log, "任务包", self._remaining(t0))
                 pack["meta"] = {"round": rnd, "created_at": started}
-                sent, hits = sanitize(json.dumps(pack, ensure_ascii=False, indent=2))
+                sent_obj, hits = sanitize_obj(pack)
                 if hits:
                     log(f"第 {rnd} 轮：发给 B 前脱敏 {hits} 处")
+                sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
                 b_out = self.b.send(sent, self._remaining(t0))
                 verdict = self._get_json(
                     lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
