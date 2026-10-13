@@ -135,6 +135,11 @@ def similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _js(o):
+    """dict -> JSON 字符串；None 保持 None（留痕中区分「未产生」与「空」）。"""
+    return json.dumps(o, ensure_ascii=False) if o is not None else None
+
+
 # ---------- SQLite 留痕 ----------
 
 class Store:
@@ -147,8 +152,12 @@ class Store:
         self._db.execute("""CREATE TABLE IF NOT EXISTS rounds(
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, round_no INTEGER,
             task_pack TEXT, sent_to_b TEXT, b_output TEXT, verdict TEXT,
-            duration_ms INTEGER, status TEXT, started_at TEXT)""")
+            duration_ms INTEGER, status TEXT, started_at TEXT, stage TEXT)""")
         self._db.commit()
+        cols = [r[1] for r in self._db.execute("PRAGMA table_info(rounds)")]
+        if "stage" not in cols:  # 旧库迁移
+            self._db.execute("ALTER TABLE rounds ADD COLUMN stage TEXT")
+            self._db.commit()
 
     def create_session(self, directive, adapter_a, adapter_b, config) -> int:
         cur = self._db.execute(
@@ -157,11 +166,12 @@ class Store:
         self._db.commit()
         return cur.lastrowid
 
-    def log_round(self, sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at):
+    def log_round(self, sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at, stage):
+        """pack/sent/b_out/verdict 传 None 表示该数据在本轮中尚未产生（F3：已产生必须落库）。"""
         self._db.execute(
             "INSERT INTO rounds(session_id, round_no, task_pack, sent_to_b, b_output, verdict,"
-            " duration_ms, status, started_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at))
+            " duration_ms, status, started_at, stage) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at, stage))
         self._db.commit()
 
     def finish_session(self, sid, status, final_output):
@@ -174,7 +184,7 @@ class Store:
 
     def rounds(self, sid):
         return self._db.execute(
-            "SELECT round_no, status, duration_ms, task_pack, sent_to_b, b_output, verdict"
+            "SELECT round_no, status, duration_ms, task_pack, sent_to_b, b_output, verdict, stage"
             " FROM rounds WHERE session_id=? ORDER BY round_no", (sid,)).fetchall()
 
 
@@ -225,38 +235,43 @@ class Engine:
                 break
             t0 = time.monotonic()
             started = datetime.now().isoformat(timespec="seconds")
+            pack = sent = b_out = None
+            stage = "plan"
             try:
                 history = f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。" if verdicts else ""
                 pack = self._get_json(
                     lambda: PLAN_PROMPT.format(directive=directive, history=history),
                     validate_pack, log, "任务包", self._remaining(t0))
+                stage = "execute"
                 pack["meta"] = {"round": rnd, "created_at": started}
                 sent_obj, hits = sanitize_obj(pack)
                 if hits:
                     log(f"第 {rnd} 轮：发给 B 前脱敏 {hits} 处")
                 sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
                 b_out = self.b.send(sent, self._remaining(t0))
+                stage = "review"
                 verdict = self._get_json(
                     lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
                                                  output=b_out),
                     validate_verdict, log, "验收结果", self._remaining(t0))
+                stage = "done"
             except TimeoutError:
-                self.store.log_round(sid, rnd, "", "", "", "", int((time.monotonic() - t0) * 1000),
-                                     "timeout", started)
-                log(f"第 {rnd} 轮：单轮超时（{self.cfg['round_timeout']}s），进入下一轮")
+                self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
+                                     int((time.monotonic() - t0) * 1000), "timeout", started, stage)
+                log(f"第 {rnd} 轮：单轮超时（{self.cfg['round_timeout']}s，进行到 {stage}），进入下一轮")
                 continue
             except Aborted:
                 status = "aborted"
                 break
             except (PackInvalid, AdapterError) as e:
-                self.store.log_round(sid, rnd, "", "", "", "",
-                                     int((time.monotonic() - t0) * 1000), "error", started)
-                log(f"第 {rnd} 轮中止：{e}")
+                self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
+                                     int((time.monotonic() - t0) * 1000), "error", started, stage)
+                log(f"第 {rnd} 轮中止（进行到 {stage}）：{e}")
                 status = "failed"
                 break
             duration = int((time.monotonic() - t0) * 1000)
-            self.store.log_round(sid, rnd, json.dumps(pack, ensure_ascii=False), sent, b_out,
-                                 json.dumps(verdict, ensure_ascii=False), duration, "ok", started)
+            self.store.log_round(sid, rnd, _js(pack), sent, b_out,
+                                 json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done")
             verdicts.append(verdict["comments"])
             log(f"第 {rnd} 轮：验收{'通过 ✓' if verdict['passed'] else '不通过 ✗'} — {verdict['comments']}")
             if verdict["passed"]:

@@ -35,9 +35,9 @@ def run_demo():
     print(f"\n[demo] 会话结果: {result['status']}，共 {result['rounds']} 轮")
     print(f"[demo] 最终产出:\n{result['final_output']}")
     print("\n[demo] SQLite 留痕（每轮任务包/产出/验收/耗时）:")
-    for no, st, ms, pack, sent, b_out, verdict in engine.store.rounds(result["session_id"]):
-        print(f"  轮 {no} [{st}] {ms}ms | 脱敏后发出 {len(sent)} 字符 | "
-              f"B 产出 {len(b_out or '')} 字符 | 验收: {verdict[:60]}")
+    for no, st, ms, pack, sent, b_out, verdict, stage in engine.store.rounds(result["session_id"]):
+        print(f"  轮 {no} [{st}@{stage}] {ms}ms | 脱敏后发出 {len(sent or '')} 字符 | "
+              f"B 产出 {len(b_out or '')} 字符 | 验收: {verdict[:60] if verdict else '-'}")
     stop()
 
 

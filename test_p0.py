@@ -216,4 +216,32 @@ assert "sk-testabcd5678efgh" not in sent and "13812345678" not in sent and "1391
 assert reloaded["goal"] == "修 bug" and reloaded["inputs"][2]["user_id"] == "[已脱敏:手机号]"
 assert f2_pack["inputs"][1] == "sk-testabcd5678efgh"  # 原对象不被原地修改
 
+# 15. F3 回归：review 阶段超时——已产生的任务包/发出内容/B 产出必须留痕，不得整轮写空
+class TimeoutReviewA(FakeA):
+    def send(self, payload, timeout):
+        if payload.startswith("你是任务布置型 Agent A，现在验收"):
+            raise TimeoutError("单轮超时")
+        return super().send(payload, timeout)
+
+
+r, logs, store = run_engine(TimeoutReviewA(bad_first=False), FakeB(),
+                            {"max_rounds": 1, "round_timeout": 30})
+rows = store.rounds(r["session_id"])
+assert len(rows) == 1, rows
+no, st, ms, tpk, snt, bout, vdt, stage = rows[0]
+assert st == "timeout" and stage == "review", rows[0]
+assert tpk and snt and bout and not vdt, "B 已产出却被丢弃：留痕字段为空"
+
+# 16. F3：B 执行超时的轮次，task_pack/sent_to_b 已产生也必须留痕
+r, logs, store = run_engine(FakeA(bad_first=False), FakeB("timeout"),
+                            {"max_rounds": 1, "round_timeout": 30})
+no, st, ms, tpk, snt, bout, vdt, stage = store.rounds(r["session_id"])[0]
+assert st == "timeout" and stage == "execute"
+assert tpk and snt and not bout, "超时轮已产生的 pack/sent 未留痕"
+
+# 17. F3：A 出包失败轮，未产生的字段为 None（而非整轮空串），stage 标明进行到哪一步
+r, logs, store = run_engine(HopelessA(), FakeB())
+no, st, ms, tpk, snt, bout, vdt, stage = store.rounds(r["session_id"])[0]
+assert st == "error" and stage == "plan" and tpk is None and snt is None
+
 print("OK — P0 全部自检通过")
