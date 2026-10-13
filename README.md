@@ -11,29 +11,46 @@ B 产出回传 A 验收，不通过就循环，直到通过。A 的验收意见�
               通过 → 停止，输出最终结果
 ```
 
-## 运行（本机 Python 3.12，零第三方依赖）
+## 运行
 
+**桌面应用（正式 UI，web 版）**：
+```bash
+py server.py          # 打开桌面窗口（pywebview + WebView2 + Vue 前端，深色主题）
+py server.py --browser  # 备用：系统浏览器打开同一界面
+```
+
+**开发 / 验证 / 无界面模式**：
 ```bash
 py test_p0.py                 # P0 全量自检
 py test_p1.py                 # P1 自检（重新布置/导出脱敏/设置池/聚焦冒烟）
-py app.py                     # 打开正式 UI（布置 / 时间线 / 设置 三页）
 py app.py --demo              # 无界面端到端演示：本地 mock，3 轮循环验收通过
-py app.py --ui-selftest       # UI 自动自检（跑一次 mock 会话并校验结果）
 py app.py --e2e "指令"        # 无界面真实端到端：按 data/settings.json 的 A/B 绑定跑
 py scenarios/e2e_rounds.py    # 修复 bug 场景验证：真实 LLM 验收 + 渐进补全 B，3 轮循环
+py scenarios/webui_smoke.py   # Web UI 冒烟（headless server + API 全链路）
 ```
+
+**前端（webui/）开发**：Node 18+ 与 npm（本机 zip 免安装版位于
+`C:\Users\30784\AppData\Local\Programs\nodejs`，已入用户 PATH）：
+```bash
+cd webui && npm install --registry=https://registry.npmmirror.com
+npm run dev       # 开发服务器 :5180，/api 代理到 :8977（需先起 py server.py --headless）
+npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，无需 Node 常驻）
+```
+运行桌面版不依赖 Node——只消费 `webui_dist/` 构建产物；Node 仅在改前端时需要。
 
 ## 文件
 
 | 文件 | 职责 |
 |------|------|
+| `server.py` | Web UI 宿主：stdlib HTTP API + 静态托管 webui_dist + pywebview 桌面壳（`--browser`/`--headless` 备用模式；`RELAY_PORT` 可换端口） |
+| `webui/` | Vue 3 + Vite 前端源码（任务布置 / 轮次时间线 / 设置 三页，深色主题） |
 | `engine.py` | 任务引擎：任务包必填校验（缺字段打回 A 补全）、脱敏、轮次/单轮超时/僵局判定、重新布置、SQLite 留痕、导出（脱敏后） |
 | `adapters.py` | 适配器框架：`send(payload, timeout) -> str` + `supports()`；API 类（含 `test_connection`）+ 剪贴板半自动（含窗口聚焦）；统一异常归一 |
 | `settings.py` | 设置持久化：Agent 配置池（多候选）、A/B 绑定、循环参数，存本地 `data/settings.json` |
-| `app.py` | 正式 UI 三页（任务布置 / 轮次时间线 / 设置）+ `--demo` / `--e2e` / `--ui-selftest` 模式 |
+| `app.py` | CLI 入口（`--demo` / `--e2e`；原 tkinter UI 已由 web 版替代移除） |
 | `mock_agent.py` | 本地演示 Agent（OpenAI 兼容 HTTP），仅用于演示与测试，不是预设 Agent |
 | `test_p0.py` / `test_p1.py` | 自检 |
-| `scenarios/` | 端到端验证场景：`demo_project`（带已知 bug 的示例项目）、`e2e_rounds.py`（真实 LLM 验收 + 渐进补全 B 的 3 轮循环场景） |
+| `scenarios/` | 端到端验证场景：`demo_project`（带已知 bug 的示例项目）、`e2e_rounds.py`（真实 LLM 验收 + 渐进补全 B 的 3 轮循环）、`webui_smoke.py` |
 | `data/` | 运行时生成：`relay.db`（留痕）、`settings.json`（含 key，仅本地） |
 
 ## 配置 A / B（设置页管理，App 不预设任何 Agent）
@@ -67,16 +84,19 @@ py scenarios/e2e_rounds.py    # 修复 bug 场景验证：真实 LLM 验收 + �
 
 ## 技术选型
 
-需求建议 Tauri/Electron，但本机无 Rust 与 Node 工具链（两者均需 GB 级安装，无法当日交付演示），
-而 P0 的本质——引擎、适配器、脱敏、留痕——是纯逻辑，Python 3.12 标准库
-（tkinter/sqlite3/urllib/difflib/re）零依赖全覆盖，故 P0 用 Python 实现。
-引擎与适配器接口与语言无关，若后续确认走 Tauri，此逻辑可直接平移到 Rust。
+需求建议 Tauri/Electron。P0 期本机无 Rust 与 Node 工具链，引擎/适配器/脱敏/留痕用 Python
+3.12 标准库实现（此核心至今保持零第三方依赖，仅引擎层）。UI 演进三步：
+
+1. **P0/P1 初版**：tkinter 桌面控件（当时唯一零依赖选项，视觉朴素）；
+2. **现版（2026-10-13 起）**：安装 Node 22（官方 zip 免安装版，`AppData\Local\Programs\nodejs`）
+   后用 **Vite + Vue 3** 重写前端，桌面壳为 **pywebview**（WebView2 渲染）——运行期仅依赖
+   pywebview 一个 pip 包，桌面版不依赖 Node；tkinter 版已移除；
+3. **若迁 Tauri**：引擎与适配器接口语言无关，可平移 Rust，前端代码（Vue）可直接复用。
 
 **选型豁免登记（F22）**：该偏差为环境约束下的工程决策，需求文档 v0.1 未正式登记。
 复查触发条件——满足其一时重新评估迁移 Tauri/Electron：
-1. 本机可用 Rust（cargo）或 Node（npm）工具链；
-2. 需要打包独立安装分发给其他机器（Python 打包体验明显差于 Tauri）；
-3. 出现需要非 Python 原生能力的功能（系统托盘、全局快捷键、深度窗口控制）。
+1. 需要打包独立安装分发给其他机器（pywebview + Python 打包体验差于 Tauri）；
+2. 出现需要非 WebView 原生能力的功能（系统托盘、全局快捷键、深度窗口控制）。
 
 ## P0 复审登记项的处置（2026-10-13 P1 全部清偿）
 

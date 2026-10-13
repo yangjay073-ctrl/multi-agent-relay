@@ -125,13 +125,15 @@ class ApiAdapter(Adapter):
 class ClipboardAdapter(Adapter):
     label = "clipboard"
 
-    def __init__(self, put_clipboard, notify_wait, launch_command: str = ""):
-        """put_clipboard(text)：线程安全地把文本写入系统剪贴板（由 UI 注入）。
+    def __init__(self, put_clipboard, notify_wait, launch_command: str = "", on_done=None):
+        """put_clipboard(text)：线程安全地把文本写入系统剪贴板（由宿主注入）。
         notify_wait(adapter, payload, token)：进入等待时通知 UI，token 标识本次等待，
         UI 回传时必须带回同一 token，防止上一轮的迟到回传串入下一轮（F6）。
-        launch_command：可选，等待粘贴前尝试启动/聚焦的目标程序路径。"""
+        launch_command：可选，等待粘贴前尝试启动/聚焦的目标程序路径。
+        on_done()：本次 send 结束（成功/超时/中止）时回调，宿主据此清等待状态。"""
         self._put = put_clipboard
         self._notify = notify_wait
+        self._on_done = on_done or (lambda: None)
         self.launch_command = launch_command
         self._evt = threading.Event()
         self._abort = threading.Event()
@@ -168,6 +170,10 @@ class ClipboardAdapter(Adapter):
             return self._result
         finally:
             self._active = False
+            try:
+                self._on_done()
+            except Exception:
+                pass
 
     def deliver(self, token: int, text: str) -> bool:
         """UI 在用户粘贴回产出时调用。token 不匹配当前等待（迟到/失效）则丢弃。"""
