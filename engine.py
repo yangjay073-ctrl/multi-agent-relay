@@ -39,6 +39,10 @@ class PackInvalid(RuntimeError):
     """A 连续 PACK_RETRIES 次给不出合法任务包。"""
 
 
+class ReplanRequested(RuntimeError):
+    """用户终止本轮并要求重新布置（需求 §9.2 / F20）。"""
+
+
 # ---------- 任务包 / 验收结果校验 ----------
 
 def extract_json(text: str) -> dict:
@@ -194,6 +198,32 @@ class Store:
     def get_session(self, sid):
         return self._db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
 
+    def sessions_list(self):
+        return self._db.execute(
+            "SELECT id, directive, status, created_at, ended_at FROM sessions"
+            " ORDER BY id DESC").fetchall()
+
+    def export_session(self, sid, path) -> str:
+        """导出整会话留痕为 JSON。F21：task_pack 是未脱敏原文，导出前必须重新脱敏；
+        b_output/verdict 等文本字段同样过一遍文本脱敏。"""
+        sess = dict(self.get_session(sid))
+        rows = []
+        for r in self.rounds(sid):
+            r = dict(r)
+            if r["task_pack"]:
+                try:
+                    r["task_pack"] = json.dumps(sanitize_obj(json.loads(r["task_pack"]))[0],
+                                                ensure_ascii=False)
+                except (ValueError, json.JSONDecodeError):
+                    r["task_pack"], _ = sanitize(r["task_pack"])
+            for f in ("sent_to_b", "b_output", "verdict"):
+                if r[f]:
+                    r[f], _ = sanitize(r[f])
+            rows.append(r)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"session": sess, "rounds": rows}, f, ensure_ascii=False, indent=2)
+        return path
+
     def close(self):
         self._db.close()
 
@@ -210,9 +240,22 @@ class Engine:
         self.a, self.b, self.store = adapter_a, adapter_b, store
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
         self._stop = threading.Event()
+        self._replan = threading.Event()
 
     def stop(self):
         self._stop.set()
+
+    def request_replan(self):
+        """用户终止本轮、要求 A 重新布置（F20）。在轮内检查点生效，作废当前轮进入下一轮。"""
+        self._replan.set()
+
+    def _check_cancel(self):
+        """轮内取消检查点：终止优先于重新布置。"""
+        if self._stop.is_set():
+            raise Aborted("用户终止")
+        if self._replan.is_set():
+            self._replan.clear()
+            raise ReplanRequested("用户终止本轮，要求重新布置")
 
     def _remaining(self, t0):
         left = self.cfg["round_timeout"] - (time.monotonic() - t0)
@@ -227,8 +270,7 @@ class Engine:
         original = prompt = build_prompt()
         last_err = None
         for _ in range(PACK_RETRIES):
-            if self._stop.is_set():
-                raise Aborted("用户终止")
+            self._check_cancel()
             raw = self.a.send(prompt, remaining())
             try:
                 obj = extract_json(raw)
@@ -247,6 +289,7 @@ class Engine:
         sid = self.store.create_session(directive, self.a.label, self.b.label, self.cfg)
         verdicts, outputs, status, final, rnd = [], [], "max_rounds", None, 0
         executed = 0
+        last_replan = False
         log(f"会话 #{sid} 开始：{directive}")
         try:
             for rnd in range(1, self.cfg["max_rounds"] + 1):
@@ -258,8 +301,12 @@ class Engine:
                 started = datetime.now().isoformat(timespec="seconds")
                 pack = sent = b_out = None
                 stage = "plan"
+                replan_hint = last_replan
+                last_replan = False
                 try:
-                    history = f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。" if verdicts else ""
+                    history = ("上一轮被用户终止，请重新布置任务包。" if replan_hint else
+                               f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。"
+                               if verdicts else "")
                     pack = self._get_json(
                         lambda: PLAN_PROMPT.format(directive=directive, history=history),
                         validate_pack, log, "任务包", lambda: self._remaining(t0))
@@ -270,6 +317,7 @@ class Engine:
                         log(f"第 {rnd} 轮：发给 B 前脱敏 {hits} 处")
                     sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
                     b_out = self.b.send(sent, self._remaining(t0))
+                    self._check_cancel()  # B 执行中收到重新布置请求：产出留痕后作废本轮（F20）
                     stage = "review"
                     verdict = self._get_json(
                         lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
@@ -284,6 +332,12 @@ class Engine:
                 except Aborted:
                     status = "aborted"
                     break
+                except ReplanRequested as e:
+                    self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
+                                         int((time.monotonic() - t0) * 1000), "replan", started, stage)
+                    log(f"第 {rnd} 轮：{e}（已产生的数据已留痕）")
+                    last_replan = True
+                    continue
                 except (PackInvalid, AdapterError) as e:
                     self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
                                          int((time.monotonic() - t0) * 1000), "error", started, stage)

@@ -8,6 +8,7 @@
 import json
 import os
 import socket
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -15,6 +16,43 @@ import urllib.request
 
 class Aborted(RuntimeError):
     """用户终止会话。"""
+
+
+def focus_window_by_exe(exe_name: str) -> bool:
+    """把属于 exe_name（如 notepad.exe）的可见窗口置前（F17，仅 Windows）。
+    成功 True；找不到或非 Windows 返回 False。"""
+    import ctypes
+    import ctypes.wintypes as w
+    if sys.platform != "win32":
+        return False
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    hits = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, w.HWND, w.LPARAM)
+    def on_window(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = w.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return True
+        buf = ctypes.create_unicode_buffer(512)
+        size = w.DWORD(512)
+        try:
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)) \
+                    and os.path.basename(buf.value).lower() == exe_name.lower():
+                hits.append(hwnd)
+        finally:
+            kernel32.CloseHandle(h)
+        return True
+
+    user32.EnumWindows(on_window, 0)
+    if not hits:
+        return False
+    user32.ShowWindow(hits[0], 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hits[0])  # 前台锁定限制下可能失败，窗口至少已还原
+    return True
 
 
 class AdapterError(RuntimeError):
@@ -42,13 +80,24 @@ class ApiAdapter(Adapter):
         self.api_key, self.model = api_key, model
 
     def send(self, payload: str, timeout: float) -> str:
+        return self._request(payload, timeout)
+
+    def test_connection(self) -> str:
+        """设置页「测试连接」（F18）：走一次完整请求链路验证端点/key/model。"""
+        return self._request("连接测试，请只回复：ok", 30.0)
+
+    def _request(self, payload: str, timeout: float) -> str:
         body = json.dumps({"model": self.model,
                            "messages": [{"role": "user", "content": payload}]}).encode()
         req = urllib.request.Request(self.url, data=body, headers={
             "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
         try:
-            with urllib.request.urlopen(req, timeout=max(0.05, timeout)) as r:
-                data = json.loads(r.read().decode())
+            try:
+                with urllib.request.urlopen(req, timeout=max(0.05, timeout)) as r:
+                    raw = r.read().decode()
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise AdapterError(f"API 响应非 JSON: {e}; 响应前200字符: {raw[:200]!r}")
             if not isinstance(data, dict):
                 raise AdapterError("API 响应顶层不是 JSON 对象")
             choices = data.get("choices")
@@ -105,9 +154,12 @@ class ClipboardAdapter(Adapter):
             self._put(payload)
             if self.launch_command:
                 try:
-                    os.startfile(self.launch_command)  # Windows：启动/聚焦目标程序
+                    exe = os.path.basename(self.launch_command)
+                    if not (exe.lower().endswith(".exe")
+                            and focus_window_by_exe(exe)):  # 先聚焦已运行窗口（F17）
+                        os.startfile(self.launch_command)  # 找不到再启动新实例
                 except OSError:
-                    pass  # 聚焦失败不阻塞流程，剪贴板内容已就绪
+                    pass  # 聚焦/启动失败不阻塞流程，剪贴板内容已就绪
             self._notify(self, payload, self._token)
             if not self._evt.wait(max(0.05, timeout)):
                 raise TimeoutError("等待剪贴板回传超时")
