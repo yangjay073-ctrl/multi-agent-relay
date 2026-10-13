@@ -41,9 +41,20 @@ class ApiAdapter(Adapter):
         req = urllib.request.Request(self.url, data=body, headers={
             "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
         try:
-            with urllib.request.urlopen(req, timeout=max(1, timeout)) as r:
+            with urllib.request.urlopen(req, timeout=max(0.05, timeout)) as r:
                 data = json.loads(r.read().decode())
-            return data["choices"][0]["message"]["content"]
+            if not isinstance(data, dict):
+                raise AdapterError("API 响应顶层不是 JSON 对象")
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise AdapterError("API 响应缺少非空 choices")
+            first = choices[0]
+            if not isinstance(first, dict) or not isinstance(first.get("message"), dict):
+                raise AdapterError("API 响应缺少 message 对象")
+            content = first["message"].get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise AdapterError("API 响应 content 为空或非字符串")
+            return content
         except (socket.timeout, TimeoutError):
             raise TimeoutError(f"API 超时: {self.url}")
         except urllib.error.HTTPError as e:
@@ -52,7 +63,7 @@ class ApiAdapter(Adapter):
             if isinstance(getattr(e, "reason", None), socket.timeout):
                 raise TimeoutError(f"API 超时: {self.url}")
             raise AdapterError(f"API 连接失败: {e}")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
             raise AdapterError(f"API 响应格式不符: {e}")
 
 

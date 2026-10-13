@@ -146,6 +146,7 @@ class Store:
     def __init__(self, path="data/relay.db"):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
         self._db.execute("""CREATE TABLE IF NOT EXISTS sessions(
             id INTEGER PRIMARY KEY AUTOINCREMENT, directive TEXT, adapter_a TEXT, adapter_b TEXT,
             config TEXT, status TEXT, final_output TEXT, created_at TEXT, ended_at TEXT)""")
@@ -178,6 +179,9 @@ class Store:
         self._db.execute("UPDATE sessions SET status=?, final_output=?, ended_at=? WHERE id=?",
                          (status, final_output, datetime.now().isoformat(timespec="seconds"), sid))
         self._db.commit()
+
+    def get_session(self, sid):
+        return self._db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
 
     def close(self):
         self._db.close()
@@ -230,60 +234,65 @@ class Engine:
         sid = self.store.create_session(directive, self.a.label, self.b.label, self.cfg)
         verdicts, status, final, rnd = [], "max_rounds", None, 0
         log(f"会话 #{sid} 开始：{directive}")
-        for rnd in range(1, self.cfg["max_rounds"] + 1):
-            if self._stop.is_set():
-                status = "aborted"
-                break
-            t0 = time.monotonic()
-            started = datetime.now().isoformat(timespec="seconds")
-            pack = sent = b_out = None
-            stage = "plan"
-            try:
-                history = f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。" if verdicts else ""
-                pack = self._get_json(
-                    lambda: PLAN_PROMPT.format(directive=directive, history=history),
-                    validate_pack, log, "任务包", self._remaining(t0))
-                stage = "execute"
-                pack["meta"] = {"round": rnd, "created_at": started}
-                sent_obj, hits = sanitize_obj(pack)
-                if hits:
-                    log(f"第 {rnd} 轮：发给 B 前脱敏 {hits} 处")
-                sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
-                b_out = self.b.send(sent, self._remaining(t0))
-                stage = "review"
-                verdict = self._get_json(
-                    lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
-                                                 output=b_out),
-                    validate_verdict, log, "验收结果", self._remaining(t0))
-                stage = "done"
-            except TimeoutError:
-                self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
-                                     int((time.monotonic() - t0) * 1000), "timeout", started, stage)
-                log(f"第 {rnd} 轮：单轮超时（{self.cfg['round_timeout']}s，进行到 {stage}），进入下一轮")
-                continue
-            except Aborted:
-                status = "aborted"
-                break
-            except (PackInvalid, AdapterError) as e:
-                self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
-                                     int((time.monotonic() - t0) * 1000), "error", started, stage)
-                log(f"第 {rnd} 轮中止（进行到 {stage}）：{e}")
-                status = "failed"
-                break
-            duration = int((time.monotonic() - t0) * 1000)
-            self.store.log_round(sid, rnd, _js(pack), sent, b_out,
-                                 json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done")
-            verdicts.append(verdict["comments"])
-            log(f"第 {rnd} 轮：验收{'通过 ✓' if verdict['passed'] else '不通过 ✗'} — {verdict['comments']}")
-            if verdict["passed"]:
-                status, final = "success", b_out
-                break
-            if len(verdicts) >= 2 and similarity(verdicts[-1], verdicts[-2]) > DEADLOCK_SIM:
-                status = "deadlock"
-                log("僵局：连续两次验收意见无实质变化（相似度 > 0.9），终止，请重新布置")
-                break
-        else:
-            log(f"已达最大轮数 {self.cfg['max_rounds']}，终止")
-        self.store.finish_session(sid, status, final)
+        try:
+            for rnd in range(1, self.cfg["max_rounds"] + 1):
+                if self._stop.is_set():
+                    status = "aborted"
+                    break
+                t0 = time.monotonic()
+                started = datetime.now().isoformat(timespec="seconds")
+                pack = sent = b_out = None
+                stage = "plan"
+                try:
+                    history = f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。" if verdicts else ""
+                    pack = self._get_json(
+                        lambda: PLAN_PROMPT.format(directive=directive, history=history),
+                        validate_pack, log, "任务包", self._remaining(t0))
+                    stage = "execute"
+                    pack["meta"] = {"round": rnd, "created_at": started}
+                    sent_obj, hits = sanitize_obj(pack)
+                    if hits:
+                        log(f"第 {rnd} 轮：发给 B 前脱敏 {hits} 处")
+                    sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
+                    b_out = self.b.send(sent, self._remaining(t0))
+                    stage = "review"
+                    verdict = self._get_json(
+                        lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
+                                                     output=b_out),
+                        validate_verdict, log, "验收结果", self._remaining(t0))
+                    stage = "done"
+                except TimeoutError:
+                    self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
+                                         int((time.monotonic() - t0) * 1000), "timeout", started, stage)
+                    log(f"第 {rnd} 轮：单轮超时（{self.cfg['round_timeout']}s，进行到 {stage}），进入下一轮")
+                    continue
+                except Aborted:
+                    status = "aborted"
+                    break
+                except (PackInvalid, AdapterError) as e:
+                    self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
+                                         int((time.monotonic() - t0) * 1000), "error", started, stage)
+                    log(f"第 {rnd} 轮中止（进行到 {stage}）：{e}")
+                    status = "failed"
+                    break
+                duration = int((time.monotonic() - t0) * 1000)
+                self.store.log_round(sid, rnd, _js(pack), sent, b_out,
+                                     json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done")
+                verdicts.append(verdict["comments"])
+                log(f"第 {rnd} 轮：验收{'通过 ✓' if verdict['passed'] else '不通过 ✗'} — {verdict['comments']}")
+                if verdict["passed"]:
+                    status, final = "success", b_out
+                    break
+                if len(verdicts) >= 2 and similarity(verdicts[-1], verdicts[-2]) > DEADLOCK_SIM:
+                    status = "deadlock"
+                    log("僵局：连续两次验收意见无实质变化（相似度 > 0.9），终止，请重新布置")
+                    break
+            else:
+                log(f"已达最大轮数 {self.cfg['max_rounds']}，终止")
+        except Exception as e:  # 兜底（F5）：任何未预期异常也必须收尾会话，不留悬挂行
+            status = "failed"
+            log(f"引擎异常终止：{type(e).__name__}: {e}")
+        finally:
+            self.store.finish_session(sid, status, final)
         log(f"会话 #{sid} 结束：{status}（共 {rnd} 轮）")
         return {"session_id": sid, "status": status, "rounds": rnd, "final_output": final}

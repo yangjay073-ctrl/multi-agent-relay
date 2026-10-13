@@ -266,4 +266,43 @@ assert retries, "未发生打回"
 assert all(p.startswith("你是任务布置型 Agent A") for p in retries), "打回后丢失原上下文"
 assert any("用户指令" in p and "修复登录头像不刷新" in p for p in retries), "打回后丢失用户指令"
 
+# 19. F5 回归：四种畸形响应归一为 AdapterError，run() 返回 failed 且 sessions 行完整收尾
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from adapters import ApiAdapter
+import threading as _threading
+
+
+def start_stub(body_obj):
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps(body_obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    _threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}/v1", srv.shutdown
+
+
+for bad_label, bad_body in [
+    ("顶层数组", [1, 2]),
+    ("message 是字符串", {"choices": [{"message": "content 是字符串"}]}),
+    ("content 为 null", {"choices": [{"message": {"content": None}}]}),
+    ("choices 为空", {"choices": []}),
+]:
+    stub_url, stop_stub = start_stub(bad_body)
+    r, logs, store = run_engine(ApiAdapter(stub_url, "k", "m"), FakeB())
+    assert r["status"] == "failed", (bad_label, r)
+    sess = store.get_session(r["session_id"])
+    assert sess["status"] == "failed" and sess["ended_at"] and sess["final_output"] is None, bad_label
+    assert any("API 响应" in m for m in logs), bad_label
+    stop_stub()
+
 print("OK — P0 全部自检通过")
