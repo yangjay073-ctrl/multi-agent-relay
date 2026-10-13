@@ -24,6 +24,10 @@ class AdapterError(RuntimeError):
 class Adapter:
     label = "adapter"
 
+    def supports(self, role: str) -> bool:
+        """该适配器能否担任此角色。两类适配器均可担任 A 或 B；可用性探测留待 P1（F18）。"""
+        return role in ("A", "B")
+
     def send(self, payload: str, timeout: float) -> str:
         raise NotImplementedError
 
@@ -32,7 +36,9 @@ class ApiAdapter(Adapter):
     label = "api"
 
     def __init__(self, base_url: str, api_key: str, model: str):
-        self.url = base_url.rstrip("/") + "/chat/completions"
+        base = base_url.rstrip("/")
+        # 用户粘贴完整端点时不再重复拼接（F14）
+        self.url = base if base.endswith("/chat/completions") else base + "/chat/completions"
         self.api_key, self.model = api_key, model
 
     def send(self, payload: str, timeout: float) -> str:

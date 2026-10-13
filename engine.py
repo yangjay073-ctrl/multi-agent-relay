@@ -13,7 +13,6 @@ from datetime import datetime
 
 from adapters import Aborted, AdapterError
 
-REQUIRED = ("goal", "inputs", "steps", "acceptance", "forbidden")
 PACK_RETRIES = 3      # 任务包缺字段/非法时的打回补全总尝试数
 DEADLOCK_SIM = 0.9    # 连续两次验收意见相似度阈值（> 判僵局）
 DEFAULT_CONFIG = {"max_rounds": 5, "round_timeout": 600}
@@ -43,26 +42,38 @@ class PackInvalid(RuntimeError):
 # ---------- 任务包 / 验收结果校验 ----------
 
 def extract_json(text: str) -> dict:
-    """从 A 的回复中提取 JSON（容忍 markdown 围栏与前后废话）。"""
-    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if m:
-        text = m.group(1)
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
+    """全文 raw_decode 扫描提取唯一 JSON 对象；多于一个即报错，不静默取第一个（F12）。"""
+    decoder = json.JSONDecoder()
+    found, idx = [], 0
+    while True:
+        i = text.find("{", idx)
+        if i < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, i)
+            found.append(obj)
+            idx = end
+        except ValueError:
+            idx = i + 1
+    if not found:
         raise ValueError("回复中找不到 JSON 对象")
-    return json.loads(text[start:end + 1])
+    if len(found) > 1:
+        raise ValueError(f"回复中包含 {len(found)} 个 JSON 对象，无法确定用哪个，请只输出一个")
+    return found[0]
 
 
 def validate_pack(obj) -> list:
-    """必填字段校验，返回错误列表（空 = 通过）。"""
+    """必填字段校验（含类型，F11），返回错误列表（空 = 通过）。"""
     if not isinstance(obj, dict):
         return ["任务包必须是 JSON 对象"]
     errors = []
-    for f in REQUIRED:
+    goal = obj.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        errors.append("goal 必须为非空字符串")
+    for f in ("inputs", "steps", "acceptance", "forbidden"):
         v = obj.get(f)
-        empty = v is None or v == "" or v == [] or (isinstance(v, str) and not v.strip())
-        if empty:
-            errors.append(f"缺少必填字段或为空: {f}")
+        if not isinstance(v, list) or not v:
+            errors.append(f"缺少必填字段或类型不符（须非空数组）: {f}")
     return errors
 
 
@@ -209,15 +220,16 @@ class Engine:
             raise TimeoutError("单轮超时")
         return left
 
-    def _get_json(self, build_prompt, validate, log, tag, timeout):
+    def _get_json(self, build_prompt, validate, log, tag, remaining):
         """调 A 并校验其 JSON 输出；缺字段打回补全，最多 PACK_RETRIES 次。
-        打回时在原 prompt 后追加错误说明——无状态 API 的 A 只有拿到完整上下文才能补全（F4）。"""
+        打回时在原 prompt 后追加错误说明——无状态 API 的 A 只有拿到完整上下文才能补全（F4）。
+        remaining 是 callable：每次重试前重新计算单轮剩余预算（F9）。"""
         original = prompt = build_prompt()
         last_err = None
         for _ in range(PACK_RETRIES):
             if self._stop.is_set():
                 raise Aborted("用户终止")
-            raw = self.a.send(prompt, timeout)
+            raw = self.a.send(prompt, remaining())
             try:
                 obj = extract_json(raw)
                 errors = validate(obj)
@@ -231,14 +243,17 @@ class Engine:
         raise PackInvalid(f"A 连续 {PACK_RETRIES} 次输出不合法（{tag}）：{last_err}")
 
     def run(self, directive: str, log=print) -> dict:
+        self._stop.clear()  # 实例可复用：上一次会话的终止标记不带入本次（F15）
         sid = self.store.create_session(directive, self.a.label, self.b.label, self.cfg)
-        verdicts, status, final, rnd = [], "max_rounds", None, 0
+        verdicts, outputs, status, final, rnd = [], [], "max_rounds", None, 0
+        executed = 0
         log(f"会话 #{sid} 开始：{directive}")
         try:
             for rnd in range(1, self.cfg["max_rounds"] + 1):
                 if self._stop.is_set():
                     status = "aborted"
                     break
+                executed = rnd  # 实际开始执行的轮数（首轮前中止时保持 0，F15）
                 t0 = time.monotonic()
                 started = datetime.now().isoformat(timespec="seconds")
                 pack = sent = b_out = None
@@ -247,7 +262,7 @@ class Engine:
                     history = f"上一轮验收未通过，意见：{verdicts[-1]}\n请重新布置任务包。" if verdicts else ""
                     pack = self._get_json(
                         lambda: PLAN_PROMPT.format(directive=directive, history=history),
-                        validate_pack, log, "任务包", self._remaining(t0))
+                        validate_pack, log, "任务包", lambda: self._remaining(t0))
                     stage = "execute"
                     pack["meta"] = {"round": rnd, "created_at": started}
                     sent_obj, hits = sanitize_obj(pack)
@@ -259,7 +274,7 @@ class Engine:
                     verdict = self._get_json(
                         lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
                                                      output=b_out),
-                        validate_verdict, log, "验收结果", self._remaining(t0))
+                        validate_verdict, log, "验收结果", lambda: self._remaining(t0))
                     stage = "done"
                 except TimeoutError:
                     self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
@@ -279,13 +294,17 @@ class Engine:
                 self.store.log_round(sid, rnd, _js(pack), sent, b_out,
                                      json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done")
                 verdicts.append(verdict["comments"])
+                outputs.append(b_out)
                 log(f"第 {rnd} 轮：验收{'通过 ✓' if verdict['passed'] else '不通过 ✗'} — {verdict['comments']}")
                 if verdict["passed"]:
                     status, final = "success", b_out
                     break
-                if len(verdicts) >= 2 and similarity(verdicts[-1], verdicts[-2]) > DEADLOCK_SIM:
+                if (len(verdicts) >= 2 and similarity(verdicts[-1], verdicts[-2]) > DEADLOCK_SIM
+                        and similarity(outputs[-1], outputs[-2]) > DEADLOCK_SIM):
+                    # 僵局 = 意见与 B 产出连续两轮均无实质变化；只看意见会误杀
+                    # 「验收标准第 1/2 条未满足」这类措辞相近但 B 在改进的场景（F13）
                     status = "deadlock"
-                    log("僵局：连续两次验收意见无实质变化（相似度 > 0.9），终止，请重新布置")
+                    log("僵局：连续两轮验收意见与 B 产出均无实质变化，终止，请重新布置")
                     break
             else:
                 log(f"已达最大轮数 {self.cfg['max_rounds']}，终止")
@@ -294,5 +313,5 @@ class Engine:
             log(f"引擎异常终止：{type(e).__name__}: {e}")
         finally:
             self.store.finish_session(sid, status, final)
-        log(f"会话 #{sid} 结束：{status}（共 {rnd} 轮）")
-        return {"session_id": sid, "status": status, "rounds": rnd, "final_output": final}
+        log(f"会话 #{sid} 结束：{status}（共 {executed} 轮）")
+        return {"session_id": sid, "status": status, "rounds": executed, "final_output": final}

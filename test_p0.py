@@ -1,6 +1,7 @@
 """P0 自检：py test_p0.py，全绿输出 OK。覆盖校验打回/脱敏/相似度/引擎全流程/僵局/轮数/超时/留痕。"""
 import json
 import sys
+import time
 sys.stdout.reconfigure(encoding="utf-8")
 
 from engine import (Engine, Store, extract_json, validate_pack, validate_verdict,
@@ -300,5 +301,67 @@ for bad_label, bad_body in [
     assert sess["status"] == "failed" and sess["ended_at"] and sess["final_output"] is None, bad_label
     assert any("API 响应" in m for m in logs), bad_label
     stop_stub()
+
+# 20. F11：任务包类型校验——非声明类型不得通过
+assert validate_pack(dict(full, inputs="只是一个字符串")) != []
+assert validate_pack(dict(full, steps={"a": 1})) != []
+assert validate_pack(dict(full, goal=True)) != []
+assert validate_pack(dict(full, goal=123)) != []
+
+# 21. F12：多 JSON 对象报错不静默取第一个；围栏示例与真包并存时必须报错
+for ambiguous in ('示例：```json\n{"bad": 1}\n```\n正式输出：{"good": 2}',
+                  '{"a":1} 然后 {"b":2}'):
+    try:
+        extract_json(ambiguous)
+        assert False, "多对象应报错"
+    except ValueError:
+        pass
+assert extract_json('好的 {"a": [1, 2]} 完成') == {"a": [1, 2]}
+
+# 22. F13：验收意见高度相似但 B 产出在变 → 不判僵局
+class VaryB:
+    label = "vary-b"
+    n = 0
+    def send(self, payload, timeout):
+        json.loads(payload)
+        VaryB.n += 1
+        return f"B 的产出第 {VaryB.n} 版：内容各不相同 {VaryB.n}"
+
+
+a13 = FakeA(bad_first=False, verdicts=[(False, "验收标准第 1 条未满足"),
+                                       (False, "验收标准第 2 条未满足"),
+                                       (True, "通过")])
+r, logs, _ = run_engine(a13, VaryB(), {"max_rounds": 3, "round_timeout": 30})
+assert r["status"] == "success", (r, [m for m in logs if "僵局" in m])
+
+# 23. F14：base_url 已含完整端点时不重复拼接
+assert ApiAdapter("https://x.example.com/v1/chat/completions", "k", "m").url \
+    == "https://x.example.com/v1/chat/completions"
+assert ApiAdapter("https://x.example.com/v1/", "k", "m").url \
+    == "https://x.example.com/v1/chat/completions"
+
+# 24. F15：stop() 后 Engine 实例可复用（run 开头清 stop 标记）
+store15 = fresh_store()
+eng15 = Engine(FakeA(verdicts=[(True, "通过")]), FakeB(), store15,
+               {"max_rounds": 2, "round_timeout": 30})
+assert eng15.run("第一场", log=lambda m: None)["status"] == "success"
+eng15.stop()
+assert eng15.run("第二场", log=lambda m: None)["status"] == "success", "stop 后实例不可复用"
+
+# 25. F9：打回重试每次重算剩余预算，单轮超时不会被 3 次重试突破
+class SlowHopelessA:
+    label = "slow-hopeless"
+    def __init__(self):
+        self.calls = 0
+    def send(self, payload, timeout):
+        self.calls += 1
+        time.sleep(0.6)
+        return "永远不是 JSON"
+
+
+slow_a = SlowHopelessA()
+r, logs, _ = run_engine(slow_a, FakeB(), {"max_rounds": 1, "round_timeout": 1.0})
+assert slow_a.calls == 2, f"重试未重算预算，调用了 {slow_a.calls} 次"
+assert any("单轮超时" in m for m in logs)
 
 print("OK — P0 全部自检通过")
