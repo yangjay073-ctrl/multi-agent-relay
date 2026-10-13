@@ -7,8 +7,6 @@ from engine import (Engine, Store, extract_json, validate_pack, validate_verdict
                     sanitize, sanitize_obj, similarity)
 from adapters import Aborted, ClipboardAdapter
 
-TMP_DB = "data/test_relay.db"
-
 
 class FakeA:
     """可编排的 A：plan 返回任务包（可先给缺字段的），review 按 verdicts 脚本走。"""
@@ -55,12 +53,10 @@ _last_store = None
 
 def fresh_store():
     global _last_store
-    import os
     if _last_store is not None:
         _last_store.close()
-    if os.path.exists(TMP_DB):
-        os.remove(TMP_DB)
-    _last_store = Store(TMP_DB)
+    # F16: 内存库——不落盘、无删除/占用问题，只读目录与并行运行都不再炸
+    _last_store = Store(":memory:")
     return _last_store
 
 
