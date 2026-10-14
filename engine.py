@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -18,12 +19,13 @@ DEADLOCK_SIM = 0.9    # 连续两次验收意见相似度阈值（> 判僵局）
 DEFAULT_CONFIG = {"max_rounds": 5, "round_timeout": 600}
 
 PLAN_PROMPT = """你是任务布置型 Agent A。把用户指令拆解成结构化任务包，交给执行型 Agent B 执行。
-只输出一个 JSON 对象，不要任何多余文字。字段（全部必填）：
+只输出一个 JSON 对象，不要任何多余文字。字段（verify 可选，其余必填）：
 goal: 字符串，任务目标
 inputs: 数组，输入材料
 steps: 数组，执行步骤
 acceptance: 数组，验收标准（可逐条检查）
 forbidden: 数组，禁止事项
+verify: 可选，数组，验收验证命令（每项一条 shell 命令）——想让验收基于真实执行而非 B 自述就给出，如 ["py scenarios/demo_project/test_calc.py"]；省略则不执行验证
 
 用户指令：{directive}
 {history}"""
@@ -32,7 +34,28 @@ REVIEW_PROMPT = """你是任务布置型 Agent A，现在验收执行型 Agent B
 只输出一个 JSON 对象：{{"passed": true 或 false, "comments": "逐条对照验收标准给出的验收意见"}}
 
 任务包：{pack}
-B 的产出：{output}"""
+B 的产出：{output}{verify_block}"""
+
+VERIFY_HEADER = "【执行验证结果（真实执行 B 修复后的代码所得，非 B 自述）】"
+VERIFY_RULE = "【硬规则】若任一验证命令退出码非 0 或超时，不得判通过（passed 必须为 false），并在 comments 中引用失败原因。"
+
+
+def _clip(s: str, limit: int = 2000) -> str:
+    """stdout/stderr 截断到 limit 字符，防日志/留痕/prompt 爆炸（截断即注明）。"""
+    return s if len(s) <= limit else s[:limit] + f"…（已截断，原 {len(s)} 字符）"
+
+
+def _verify_evidence(verify_result) -> str:
+    """verify 执行结果 -> 验收 prompt 证据段（每条命令一段 + 硬规则）。
+    无验证结果返回空串：review prompt 与无 verify 时代逐字一致。"""
+    if not verify_result:
+        return ""
+    parts = [VERIFY_HEADER]
+    for r in verify_result:
+        parts.append(f"命令: {r['command']}\n退出码: {r['exit_code']}\n"
+                     f"stdout: {r['stdout'] or '（空）'}\nstderr: {r['stderr'] or '（空）'}")
+    parts.append(VERIFY_RULE)
+    return "\n" + "\n".join(parts)
 
 
 class PackInvalid(RuntimeError):
@@ -78,6 +101,11 @@ def validate_pack(obj) -> list:
         v = obj.get(f)
         if not isinstance(v, list) or not v:
             errors.append(f"缺少必填字段或类型不符（须非空数组）: {f}")
+    verify = obj.get("verify")  # 可选字段：缺省 = 不验证（既有 mock/回归包均无 verify）
+    if verify is not None:
+        if (not isinstance(verify, list) or not verify
+                or not all(isinstance(c, str) and c.strip() for c in verify)):
+            errors.append("verify 若给出必须为非空字符串数组（每项一条 shell 命令）")
     return errors
 
 
@@ -168,12 +196,13 @@ class Store:
         self._db.execute("""CREATE TABLE IF NOT EXISTS rounds(
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, round_no INTEGER,
             task_pack TEXT, sent_to_b TEXT, b_output TEXT, verdict TEXT,
-            duration_ms INTEGER, status TEXT, started_at TEXT, stage TEXT)""")
+            duration_ms INTEGER, status TEXT, started_at TEXT, stage TEXT, verify_result TEXT)""")
         self._db.commit()
         cols = [r[1] for r in self._db.execute("PRAGMA table_info(rounds)")]
-        if "stage" not in cols:  # 旧库迁移
-            self._db.execute("ALTER TABLE rounds ADD COLUMN stage TEXT")
-            self._db.commit()
+        for col in ("stage", "verify_result"):  # 旧库迁移：缺列则补
+            if col not in cols:
+                self._db.execute(f"ALTER TABLE rounds ADD COLUMN {col} TEXT")
+                self._db.commit()
 
     def create_session(self, directive, adapter_a, adapter_b, config) -> int:
         cur = self._db.execute(
@@ -182,12 +211,15 @@ class Store:
         self._db.commit()
         return cur.lastrowid
 
-    def log_round(self, sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at, stage):
-        """pack/sent/b_out/verdict 传 None 表示该数据在本轮中尚未产生（F3：已产生必须落库）。"""
+    def log_round(self, sid, round_no, pack, sent, b_out, verdict, duration_ms, status,
+                  started_at, stage, verify_result=None):
+        """pack/sent/b_out/verdict 传 None 表示该数据在本轮中尚未产生（F3：已产生必须落库）。
+        verify_result 为 verify 命令真实执行结果（JSON 字符串），本轮未执行验证时为 None。"""
         self._db.execute(
             "INSERT INTO rounds(session_id, round_no, task_pack, sent_to_b, b_output, verdict,"
-            " duration_ms, status, started_at, stage) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at, stage))
+            " duration_ms, status, started_at, stage, verify_result) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, round_no, pack, sent, b_out, verdict, duration_ms, status, started_at,
+             stage, verify_result))
         self._db.commit()
 
     def finish_session(self, sid, status, final_output):
@@ -229,6 +261,8 @@ class Store:
         self._db.close()
 
     def rounds(self, sid):
+        # ponytail: 不追加 verify_result 到 SELECT——test_p0 有 3 处按位置精确解包 8 列，
+        # 加第 9 列即炸；verify_result 经 log_round 落库，需要时按列名单独查。
         return self._db.execute(
             "SELECT round_no, status, duration_ms, task_pack, sent_to_b, b_output, verdict, stage"
             " FROM rounds WHERE session_id=? ORDER BY round_no", (sid,)).fetchall()
@@ -263,6 +297,28 @@ class Engine:
         if left <= 0:
             raise TimeoutError("单轮超时")
         return left
+
+    def _run_verify(self, commands, t0) -> list:
+        """B 产出后、A 验收前，逐条真实执行任务包的 verify 命令（shell）。
+        每条收集命令/退出码/截断后的 stdout/stderr；超时记退出码 "timeout"（进程由
+        subprocess.run 负责杀）；单条 OSError 记退出码 -1，不让整个轮崩。
+        PYTHONUTF8=1 让 py 子进程管道输出统一 UTF-8，与 utf-8 解码配套（跨机器确定性）。"""
+        results = []
+        for cmd in commands:
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True,
+                                   cwd=self.cfg.get("verify_cwd") or None,
+                                   timeout=self._remaining(t0),
+                                   env={**os.environ, "PYTHONUTF8": "1"},
+                                   encoding="utf-8", errors="replace")
+                code, out, err = r.returncode, r.stdout or "", r.stderr or ""
+            except (subprocess.TimeoutExpired, TimeoutError):
+                code, out, err = "timeout", "", "验证命令超时，已被终止"
+            except OSError as e:
+                code, out, err = -1, "", f"验证命令无法执行: {e}"
+            results.append({"command": cmd, "exit_code": code,
+                            "stdout": _clip(out), "stderr": _clip(err)})
+        return results
 
     def _get_json(self, build_prompt, validate, log, tag, remaining):
         """调 A 并校验其 JSON 输出；缺字段打回补全，最多 PACK_RETRIES 次。
@@ -300,7 +356,7 @@ class Engine:
                 executed = rnd  # 实际开始执行的轮数（首轮前中止时保持 0，F15）
                 t0 = time.monotonic()
                 started = datetime.now().isoformat(timespec="seconds")
-                pack = sent = b_out = None
+                pack = sent = b_out = verify_result = None
                 stage = "plan"
                 replan_hint = last_replan
                 last_replan = False
@@ -319,15 +375,24 @@ class Engine:
                     sent = json.dumps(sent_obj, ensure_ascii=False, indent=2)
                     b_out = self.b.send(sent, self._remaining(t0))
                     self._check_cancel()  # B 执行中收到重新布置请求：产出留痕后作废本轮（F20）
+                    verify_result = None
+                    if pack.get("verify"):
+                        # B 自述不可信：验收前先真实执行验证命令，证据注入 review prompt
+                        verify_result = self._run_verify(pack["verify"], t0)
+                        bad = sum(1 for r in verify_result if r["exit_code"] != 0)
+                        log(f"第 {rnd} 轮：真实执行验证 {len(verify_result)} 条命令，"
+                            f"{'全部退出码 0' if not bad else f'{bad} 条失败（证据已注入验收）'}")
+                    verify_block = _verify_evidence(verify_result)
                     stage = "review"
                     verdict = self._get_json(
                         lambda: REVIEW_PROMPT.format(pack=json.dumps(pack, ensure_ascii=False),
-                                                     output=b_out),
+                                                     output=b_out, verify_block=verify_block),
                         validate_verdict, log, "验收结果", lambda: self._remaining(t0))
                     stage = "done"
                 except TimeoutError:
                     self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
-                                         int((time.monotonic() - t0) * 1000), "timeout", started, stage)
+                                         int((time.monotonic() - t0) * 1000), "timeout", started, stage,
+                                         _js(verify_result))
                     log(f"第 {rnd} 轮：单轮超时（{self.cfg['round_timeout']}s，进行到 {stage}），进入下一轮")
                     continue
                 except Aborted:
@@ -335,19 +400,22 @@ class Engine:
                     break
                 except ReplanRequested as e:
                     self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
-                                         int((time.monotonic() - t0) * 1000), "replan", started, stage)
+                                         int((time.monotonic() - t0) * 1000), "replan", started, stage,
+                                         _js(verify_result))
                     log(f"第 {rnd} 轮：{e}（已产生的数据已留痕）")
                     last_replan = True
                     continue
                 except (PackInvalid, AdapterError) as e:
                     self.store.log_round(sid, rnd, _js(pack), sent, b_out, None,
-                                         int((time.monotonic() - t0) * 1000), "error", started, stage)
+                                         int((time.monotonic() - t0) * 1000), "error", started, stage,
+                                         _js(verify_result))
                     log(f"第 {rnd} 轮中止（进行到 {stage}）：{e}")
                     status = "failed"
                     break
                 duration = int((time.monotonic() - t0) * 1000)
                 self.store.log_round(sid, rnd, _js(pack), sent, b_out,
-                                     json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done")
+                                     json.dumps(verdict, ensure_ascii=False), duration, "ok", started, "done",
+                                     _js(verify_result))
                 verdicts.append(verdict["comments"])
                 outputs.append(b_out)
                 log(f"第 {rnd} 轮：验收{'通过 ✓' if verdict['passed'] else '不通过 ✗'} — {verdict['comments']}")
