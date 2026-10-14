@@ -220,6 +220,7 @@ class Store:
                 if r[f]:
                     r[f], _ = sanitize(r[f])
             rows.append(r)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"session": sess, "rounds": rows}, f, ensure_ascii=False, indent=2)
         return path

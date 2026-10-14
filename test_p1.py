@@ -1,6 +1,9 @@
 """P1 自检：py test_p1.py。覆盖 F17-F21 与 P1 新功能：重新布置/导出脱敏/设置池/聚焦冒烟。"""
 import json
+import os
+import shutil
 import sys
+import tempfile
 import time
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -87,30 +90,33 @@ store._db.execute("UPDATE rounds SET task_pack=? WHERE session_id=?",
 store._db.execute("UPDATE rounds SET b_output=? WHERE session_id=?",
                   ("产出包含 13812345678 手机号", r["session_id"]))
 store._db.commit()
-path = store.export_session(r["session_id"], "data/test_export.json")
+# 导出到临时目录下不存在的子目录：既不依赖工作树 data/（A1），也回归导出自动建父目录（A3）
+export_dir = tempfile.mkdtemp()
+path = store.export_session(r["session_id"], os.path.join(export_dir, "no_such_dir_xyz", "test_export.json"))
 exported = json.load(open(path, encoding="utf-8"))
 assert "sk-e2e1234567890abcd" not in json.dumps(exported, ensure_ascii=False), "F21：敏感 key 原样导出"
 assert "13812345678" not in json.dumps(exported, ensure_ascii=False), "手机号原样导出"
+assert "[已脱敏:" in json.dumps(exported, ensure_ascii=False), "F21：导出未见脱敏占位"
 assert exported["session"]["id"] == r["session_id"] and exported["rounds"]
 assert json.loads(exported["rounds"][0]["task_pack"])["goal"] == "g"  # 仍是合法 JSON
-import os
-os.remove(path)
+shutil.rmtree(export_dir)
 
 # 4. sessions_list 倒序可查
 lst = store.sessions_list()
 assert lst and lst[0]["id"] == r["session_id"]
 
-# 5. 设置池读写往返 + 缺省合并
-tmp = "data/test_settings.json"
+# 5. 设置池读写往返 + 缺省合并（临时目录，不碰工作树 data/）
+tmp_dir = tempfile.mkdtemp()
+tmp = os.path.join(tmp_dir, "test_settings.json")
 settings_mod.save({"profiles": {"我的GLM": {"type": "api", "base_url": "https://x/v1",
                                              "api_key": "sk-x", "model": "m"}},
                    "bind": {"A": "我的GLM", "B": ""}, "max_rounds": 7, "round_timeout": 300}, tmp)
 cfg = settings_mod.load(tmp)
 assert cfg["profiles"]["我的GLM"]["model"] == "m" and cfg["bind"]["A"] == "我的GLM"
 assert cfg["max_rounds"] == 7
-empty = settings_mod.load("data/definitely_missing.json")
+empty = settings_mod.load(os.path.join(tmp_dir, "definitely_missing.json"))
 assert empty == settings_mod.DEFAULTS or empty["max_rounds"] == 5  # 缺文件回默认
-os.remove(tmp)
+shutil.rmtree(tmp_dir)
 
 # 6. F17 冒烟：不存在的进程聚焦返回 False（真实置前由 UI 手测）
 assert focus_window_by_exe("definitely_not_running_xyz.exe") is False
