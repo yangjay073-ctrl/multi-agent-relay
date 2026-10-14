@@ -1,0 +1,10 @@
+# 仅作项目元数据声明（名称/版本/Python 版本/依赖），不设 [build-system]、不走构建后端；
+# 实际安装走 requirements.txt：py -m pip install -r requirements.txt
+[project]
+name = "multi-agent-relay"
+version = "0.1.0"
+description = "多 Agent 中转协作 App：A 拆解任务包、B 执行、A 验收循环；引擎层零第三方依赖，桌面壳为 pywebview"
+requires-python = ">=3.12"
+dependencies = [
+    "pywebview>=5.0",  # 桌面壳所需；--browser / --headless 模式与引擎/CLI 模式无需任何第三方依赖
+]

@@ -1,0 +1,3 @@
+# 桌面壳所需；--browser / --headless 模式与引擎/CLI 模式无需任何第三方依赖
+pywebview>=5.0
+# webui 前端构建另需 Node 18+ 与 npm（见 README「运行」/「前端（webui/）开发」），非 pip 依赖

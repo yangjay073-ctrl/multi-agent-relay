@@ -13,7 +13,14 @@ B 产出回传 A 验收，不通过就循环，直到通过。A 的验收意见�
 
 ## 运行
 
-**首次运行前置：先构建前端**。`webui_dist/` 构建产物被 .gitignore 忽略、不入 git，
+**首次运行前置 ①：安装 Python 依赖**（Python 3.12+，仅桌面壳需要 pywebview 一个包）：
+```bash
+py -m pip install -r requirements.txt
+```
+仅 `py server.py`（桌面窗口模式）需要 pywebview；`--browser` / `--headless` 模式、CLI
+（`py app.py --demo` / `--e2e`）与自检不需要任何第三方依赖（引擎/适配器/设置层零依赖）。
+
+**首次运行前置 ②：构建前端**。`webui_dist/` 构建产物被 .gitignore 忽略、不入 git，
 克隆后本机没有，需先构建（需 Node 18+，本机安装位置见下文「前端（webui/）开发」）：
 ```bash
 cd webui && npm install --registry=https://registry.npmmirror.com && npm run build
@@ -34,6 +41,7 @@ py test_p1.py                 # P1 自检（重新布置/导出脱敏/设置池/
 py app.py --demo              # 无界面端到端演示：本地 mock，3 轮循环验收通过
 py app.py --e2e "指令"        # 无界面真实端到端：按 data/settings.json 的 A/B 绑定跑
 py scenarios/e2e_rounds.py    # 修复 bug 场景验证：真实 LLM 验收 + 渐进补全 B，3 轮循环
+py scenarios/e2e_exec.py      # 闭环执行验证：B 经 CliAdapter 真实修复 calc.py，test_calc.py 退出码 0 证实
 py scenarios/webui_smoke.py   # Web UI 冒烟（headless server + API 全链路）
 ```
 
@@ -59,7 +67,8 @@ npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，
 | `app.py` | CLI 入口（`--demo` / `--e2e`；原 tkinter UI 已由 web 版替代移除） |
 | `mock_agent.py` | 本地演示 Agent（OpenAI 兼容 HTTP），仅用于演示与测试，不是预设 Agent |
 | `test_p0.py` / `test_p1.py` | 自检 |
-| `scenarios/` | 端到端验证场景：`demo_project`（带已知 bug 的示例项目）、`e2e_rounds.py`（真实 LLM 验收 + 渐进补全 B 的 3 轮循环）、`webui_smoke.py` |
+| `scenarios/` | 端到端验证场景：`demo_project`（带已知 bug 的示例项目）、`e2e_rounds.py`（真实 LLM 验收 + 渐进补全 B 的 3 轮循环）、`e2e_exec.py`（闭环执行验证：B 经 CliAdapter 真实修复 calc.py）、`webui_smoke.py` |
+| `requirements.txt` / `pyproject.toml` | Python 依赖声明（仅 pywebview）；安装走 `py -m pip install -r requirements.txt` |
 | `data/` | 运行时生成：`relay.db`（留痕）、`settings.json`（含 key，仅本地） |
 
 ## 配置 A / B（设置页管理，App 不预设任何 Agent）
@@ -78,6 +87,14 @@ npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，
    意见 / 耗时 / 阶段），并可导出 JSON——**导出内容全部重新过脱敏规则**，密钥/手机号不会带出。
 
 注意：`api_key` 明文存于本地 `data/settings.json`（不进 git），敏感环境请自行加密盘/权限管控。
+
+## 密钥安全
+
+- `api_key` 明文存于本地 `data/settings.json`（已确认未进 git 历史，`data/` 整个被
+  .gitignore 忽略）。
+- 不要把 `data/` 移出忽略列表，也不要把它提交到任何仓库。
+- 长期本地保存的密钥建议定期轮换。
+- 多人共用机器时注意 `data/settings.json` 的文件权限。
 
 ## 关键机制（P0 实现范围）
 
@@ -146,7 +163,14 @@ npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，
   （逐项验收、两轮打回并明确指出缺项），B 为渐进补全执行代理（模拟不完美执行者，
   1→2→4→5 项逐轮补齐），完整走通 打回→补全→再验收 循环，会话留痕可查。
 
-## P1 之后的远期（不在当前范围）
+## 本地执行与闭环执行验证（原「P1 之后的远期」，已实现）
 
-真实 Agent 端到端仍受限于「B 无法本地执行代码」——产出是代码文本而非可运行验证；
-接入可本地执行的 Agent 端点（如 CLI Agent 的进程适配器）是后续方向。
+原登记的两项远期方向均已成为现状，不再是「后续」：
+
+- **CLI 进程适配器已实现**：`cli` 类适配器（`adapters.py` 的 `CliAdapter`）——任务包经
+  stdin 传入本地命令行 Agent（如 `codex exec` / `claude -p`），stdout 即产出，全自动执行；
+  B 可在其 `cwd` 工作目录里真实读写文件。配置方法见上文「连接本地电脑里的 Agent」路径二。
+- **闭环执行验证已实现**：任务包可选 `verify` 字段（A 声明验证命令）——引擎在 B 产出后
+  真实执行该命令，退出码 / stdout / stderr 作为验收证据注入 A；执行失败（验证命令未通过）
+  时 A 不得判通过。`py scenarios/e2e_exec.py` 演示：B 经 CliAdapter 真实修复
+  `demo_project/calc.py`，并由 `test_calc.py` 退出码 0 证实。
