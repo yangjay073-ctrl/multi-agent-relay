@@ -250,6 +250,13 @@ def make_handler() -> type:
 
 def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    if not os.path.isfile(os.path.join(DIST, "index.html")):
+        print("[错误] 未找到前端产物 webui_dist/index.html——该目录是 Vite 构建产物，不入 git，"
+              "克隆后本机没有，需先构建前端。")
+        print("       请先执行：cd webui && npm install --registry=https://registry.npmmirror.com "
+              "&& npm run build")
+        print("       构建完成后再运行 py server.py（详见 README.md「运行」小节）。")
+        sys.exit(1)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler())
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}/"

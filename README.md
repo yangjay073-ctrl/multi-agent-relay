@@ -13,6 +13,14 @@ B 产出回传 A 验收，不通过就循环，直到通过。A 的验收意见�
 
 ## 运行
 
+**首次运行前置：先构建前端**。`webui_dist/` 构建产物被 .gitignore 忽略、不入 git，
+克隆后本机没有，需先构建（需 Node 18+，本机安装位置见下文「前端（webui/）开发」）：
+```bash
+cd webui && npm install --registry=https://registry.npmmirror.com && npm run build
+```
+不构建则 `py server.py` 启动时会给明确报错并退出（提示同一修复命令）。构建一次后，
+正常运行不再需要 Node。
+
 **桌面应用（正式 UI，web 版）**：
 ```bash
 py server.py          # 打开桌面窗口（pywebview + WebView2 + Vue 前端，深色主题）
@@ -36,7 +44,8 @@ cd webui && npm install --registry=https://registry.npmmirror.com
 npm run dev       # 开发服务器 :5180，/api 代理到 :8977（需先起 py server.py --headless）
 npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，无需 Node 常驻）
 ```
-运行桌面版不依赖 Node——只消费 `webui_dist/` 构建产物；Node 仅在改前端时需要。
+运行桌面版不依赖 Node——只消费 `webui_dist/` 构建产物（首次克隆需先构建一次，见上文
+「运行」小节）；Node 仅在改前端时需要。
 
 ## 文件
 
