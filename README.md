@@ -107,6 +107,25 @@ npm run build     # 产物输出到 ../webui_dist（py server.py 直接托管，
 1. 需要打包独立安装分发给其他机器（pywebview + Python 打包体验差于 Tauri）；
 2. 出现需要非 WebView 原生能力的功能（系统托盘、全局快捷键、深度窗口控制）。
 
+## 连接本地电脑里的 Agent（三条路）
+
+**路径一：本地 OpenAI 兼容服务（零配置）**——设置页新增 `api` 类配置，base_url 填本地服务：
+- Ollama：`http://127.0.0.1:11434/v1`（key 随便填非空即可）
+- LM Studio：`http://127.0.0.1:1234/v1`
+- 任何自建网关（如 new-api/one-api 本地实例）
+
+**路径二：本地命令行 Agent（`cli` 类，全自动执行）**——设置页类型选 `cli`，填两个参数：
+- `command`：任务包经 **stdin** 传入、**stdout** 即产出。示例形态：
+  `codex exec --skip-git-repo-check -`（Codex CLI）、`claude -p`（Claude Code）——
+  具体参数以你安装的 Agent 文档为准，App 不预设任何 Agent；
+- `cwd`：可选工作目录，执行型 Agent 会在该目录真实读写文件；
+- ⚠ 安全：配置即授权该命令在本机执行任务，只添加你信任的 Agent；「测试连接」会真实调用一次；
+- 实现要点：Windows 按 CreateProcess 规则解析命令行（引号按 Windows 习惯书写），
+  POSIX 经 shlex 切分不经 shell；单轮超时自动 kill；非零退出/空 stdout 归一为适配器错误。
+
+**路径三：剪贴板半自动（`clipboard` 类，兜底）**——GUI-only Agent 用：写入剪贴板 +
+聚焦目标窗口（`launch_command` 填程序名如 `notepad`），人工粘贴、产出贴回 App。
+
 ## P0 复审登记项的处置（2026-10-13 P1 全部清偿）
 
 - **F17 窗口聚焦**：✅ 已实现——剪贴板模式优先把已运行的目标程序窗口置前

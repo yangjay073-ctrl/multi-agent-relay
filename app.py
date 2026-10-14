@@ -8,7 +8,7 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from adapters import ApiAdapter, ClipboardAdapter
+from adapters import ApiAdapter, CliAdapter, ClipboardAdapter
 from engine import Engine, Store
 from mock_agent import start_mock
 import settings as settings_mod
@@ -35,7 +35,7 @@ def run_e2e(directive):
     """无界面真实端到端：A/B 取 data/settings.json 的绑定。"""
     cfg = settings_mod.load()
     pool = cfg["profiles"]
-    cli = ClipboardAdapter(lambda t: print(f"\n[e2e-剪贴板] 已写入剪贴板 {len(t)} 字符；CLI 模式回传请用桌面版"),
+    clip = ClipboardAdapter(lambda t: print(f"\n[e2e-剪贴板] 已写入剪贴板 {len(t)} 字符；CLI 模式回传请用桌面版"),
                            lambda *a: None)
 
     def build(role):
@@ -46,7 +46,9 @@ def run_e2e(directive):
         if not prof:
             raise ValueError(f"角色 {role} 未绑定有效配置（settings.json bind.{role}）")
         if prof.get("type") == "clipboard":
-            return cli
+            return clip
+        if prof.get("type") == "cli":
+            return CliAdapter(prof["command"], prof.get("cwd", ""))
         return ApiAdapter(prof["base_url"], prof["api_key"], prof["model"])
 
     engine = Engine(build("A"), build("B"), Store(),

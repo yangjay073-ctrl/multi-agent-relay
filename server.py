@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.stdout.reconfigure(encoding="utf-8")
 
 import settings as settings_mod
-from adapters import ApiAdapter, ClipboardAdapter
+from adapters import ApiAdapter, CliAdapter, ClipboardAdapter
 from engine import Engine, Store
 from mock_agent import start_mock
 
@@ -89,6 +89,10 @@ class Host:
         if prof.get("type") == "clipboard":
             return ClipboardAdapter(put_clipboard_windows, self.notify_wait,
                                     prof.get("launch_command", ""), on_done=self.wait_done)
+        if prof.get("type") == "cli":
+            if not prof.get("command"):
+                raise ValueError(f"配置 {name} 缺少 command")
+            return CliAdapter(prof["command"], prof.get("cwd", ""))
         if not all((prof.get("base_url"), prof.get("api_key"), prof.get("model"))):
             raise ValueError(f"配置 {name} 缺少 base_url / api_key / model")
         return ApiAdapter(prof["base_url"], prof["api_key"], prof["model"])
@@ -235,6 +239,12 @@ def make_handler() -> type:
                     return self._json({"ok": True})
                 if u.path == "/api/profile_test":
                     p = self._body()
+                    if p.get("type") == "cli":
+                        if not p.get("command"):
+                            return self._json({"error": "缺少 command"})
+                        # 注意：cli 测试会真实执行该命令一次
+                        reply = CliAdapter(p["command"], p.get("cwd", "")).send("连接测试，请只回复：ok", 30.0)
+                        return self._json({"ok": True, "reply": reply[:200]})
                     if p.get("type") != "api":
                         return self._json({"error": "剪贴板类无需连接测试"})
                     if not all((p.get("base_url"), p.get("api_key"), p.get("model"))):

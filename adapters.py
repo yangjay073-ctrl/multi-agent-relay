@@ -7,7 +7,9 @@
 """
 import json
 import os
+import shlex
 import socket
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -120,6 +122,42 @@ class ApiAdapter(Adapter):
             raise AdapterError(f"API 连接失败: {e}")
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
             raise AdapterError(f"API 响应格式不符: {e}")
+
+
+class CliAdapter(Adapter):
+    """本地命令行 Agent：任务包经 stdin 传入，stdout 即产出（如 codex exec / claude -p）。
+
+    command 为完整命令行。Windows 下按 CreateProcess 规则解析（引号由用户按
+    Windows 习惯书写）；POSIX 下经 shlex 切分不经 shell。cwd 为可选工作目录——
+    执行型 Agent 会在该目录里真实干活。注意：配置此适配器即授权该命令本地执行。
+    """
+    label = "cli"
+
+    def __init__(self, command: str, cwd: str = ""):
+        self.command = command
+        self.cwd = cwd or None
+
+    def send(self, payload: str, timeout: float) -> str:
+        argv = self.command if sys.platform == "win32" else shlex.split(self.command)
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=self.cwd, encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise AdapterError(f"无法启动本地 Agent: {e}")
+        try:
+            out, err = proc.communicate(payload, timeout=max(0.05, timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError(f"本地 Agent 超时: {self.command}")
+        if proc.returncode != 0:
+            tail = (err or out or "").strip()[-300:]
+            raise AdapterError(f"本地 Agent 退出码 {proc.returncode}: {tail}")
+        result = (out or "").strip()
+        if not result:
+            raise AdapterError("本地 Agent 无 stdout 输出")
+        return result
 
 
 class ClipboardAdapter(Adapter):

@@ -9,7 +9,7 @@ const testing = ref(false)
 const testResult = ref('')
 const saved = ref('')
 
-const BLANK = { name: '', type: 'api', base_url: '', api_key: '', model: '', launch_command: '' }
+const BLANK = { name: '', type: 'api', base_url: '', api_key: '', model: '', launch_command: '', command: '', cwd: '' }
 
 onMounted(async () => { settings.value = await api.settings() })
 
@@ -24,6 +24,9 @@ async function save() {
   if (!name || name === '本地Mock(测试用)') { saved.value = '名称无效'; return }
   if (prof.type === 'api' && !(prof.base_url && prof.api_key && prof.model)) {
     saved.value = 'API 类需 base_url / api_key / model 全部填写'; return
+  }
+  if (prof.type === 'cli' && !prof.command) {
+    saved.value = 'CLI 类需填写 command'; return
   }
   const s = JSON.parse(JSON.stringify(settings.value))
   if (sel.value && sel.value !== name) delete s.profiles[sel.value]
@@ -71,8 +74,12 @@ async function testConn() {
     <div class="form-col card" v-if="form.name !== undefined">
       <div class="row">
         <div style="flex:1"><label class="fld">名称</label><input v-model="form.name"></div>
-        <div style="width:170px"><label class="fld">类型</label>
-          <select v-model="form.type"><option value="api">api（OpenAI 兼容）</option><option value="clipboard">clipboard（剪贴板半自动）</option></select>
+        <div style="width:220px"><label class="fld">类型</label>
+          <select v-model="form.type">
+            <option value="api">api（OpenAI 兼容）</option>
+            <option value="cli">cli（本地命令行 Agent）</option>
+            <option value="clipboard">clipboard（剪贴板半自动）</option>
+          </select>
         </div>
       </div>
       <template v-if="form.type === 'api'">
@@ -86,7 +93,18 @@ async function testConn() {
           <span style="font-size:13px" :style="{ color: testResult.startsWith('可用') ? 'var(--ok)' : 'var(--bad)' }">{{ testResult }}</span>
         </div>
       </template>
-      <template v-else>
+      <template v-if="form.type === 'cli'">
+        <div style="margin-top:10px"><label class="fld">command（任务包经 stdin 传入，stdout 即产出）</label>
+          <input v-model="form.command" placeholder="例：codex exec --skip-git-repo-check -  或  claude -p"></div>
+        <div style="margin-top:10px"><label class="fld">cwd（工作目录，执行型 Agent 在此目录干活，可空）</label>
+          <input v-model="form.cwd" placeholder="D:\projects\demo"></div>
+        <p class="hint" style="margin-top:8px; color:var(--warn)">⚠ 配置即授权该命令在本机执行任务（含文件读写），仅添加你信任的 Agent。测试连接会真实调用一次。</p>
+        <div class="row" style="margin-top:12px">
+          <button class="btn ghost" :disabled="testing" @click="testConn">{{ testing ? '测试中…' : '测试连接（真实调用）' }}</button>
+          <span style="font-size:13px" :style="{ color: testResult.startsWith('可用') ? 'var(--ok)' : 'var(--bad)' }">{{ testResult }}</span>
+        </div>
+      </template>
+      <template v-else-if="form.type === 'clipboard'">
         <div style="margin-top:10px"><label class="fld">目标程序（可执行文件名或路径，如 notepad）</label>
           <input v-model="form.launch_command" placeholder="notepad"></div>
         <p class="hint" style="margin-top:8px">发送时会优先把已运行的目标窗口置前（Windows），找不到才启动新实例。</p>

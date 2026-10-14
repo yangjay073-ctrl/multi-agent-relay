@@ -8,7 +8,7 @@ import time
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from adapters import Aborted, ClipboardAdapter, focus_window_by_exe
+from adapters import Aborted, AdapterError, CliAdapter, ClipboardAdapter, focus_window_by_exe
 from engine import Engine, ReplanRequested, Store, sanitize_obj
 import settings as settings_mod
 
@@ -142,5 +142,39 @@ assert r["status"] == "success" and r["rounds"] == 2, r
 rows = store.rounds(r["session_id"])
 assert rows[0][1] == "replan" and rows[1][1] == "ok", [row[1] for row in rows]
 ENGINE_REF[0] = None
+
+# 8. CliAdapter：本地命令行 Agent——stdin/stdout 管道、超时 kill、错误归一
+UPPER = CliAdapter('py -c "import sys; print(\'B产出:\' + sys.stdin.read().strip().upper())"')
+assert UPPER.send("hello 任务包", 30.0) == "B产出:HELLO 任务包"
+
+try:  # 超时 → TimeoutError 且进程被 kill
+    CliAdapter('py -c "import time; time.sleep(5)"').send("x", 1.0)
+    assert False, "应超时"
+except TimeoutError:
+    pass
+
+try:  # 非零退出码 → AdapterError 带 stderr 尾部
+    CliAdapter('py -c "import sys; sys.stderr.write(\'agent 崩溃信息\'); sys.exit(2)"').send("x", 30.0)
+    assert False, "应抛 AdapterError"
+except AdapterError as e:
+    assert "退出码 2" in str(e) and "崩溃信息" in str(e)
+
+try:  # 空 stdout → AdapterError
+    CliAdapter("py -c pass").send("x", 30.0)
+    assert False, "空输出应抛 AdapterError"
+except AdapterError:
+    pass
+
+try:  # 命令不存在 → AdapterError（不裸抛 FileNotFoundError）
+    CliAdapter("definitely_not_exist_xyz.exe --flag").send("x", 5.0)
+    assert False
+except AdapterError:
+    pass
+
+# 引擎集成：B 为 CliAdapter（py 模拟本地 agent），完整跑一轮 success
+eng, store, logs = fresh_engine(FakeA(verdicts=[(True, "通过")]), UPPER,
+                                {"max_rounds": 1, "round_timeout": 60})
+r = eng.run("修 bug", log=logs.append)
+assert r["status"] == "success" and "B产出:" in r["final_output"], r
 
 print("OK — P1 全部自检通过")
